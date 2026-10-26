@@ -30,17 +30,51 @@ st.caption("Monthly IMF CPI and exchange-rate data · Available observations fro
 
 
 def _read_sdmx_csv(content: bytes) -> pd.DataFrame:
-    """Read IMF SDMX CSV 1.0 or 2.0; normalize time/value columns."""
-    df = pd.read_csv(io.BytesIO(content), low_memory=False)
+    """Read IMF monthly data with validated calendar dates."""
+    df = pd.read_csv(io.BytesIO(content), low_memory=False, dtype=str)
     df.columns = [str(c).strip() for c in df.columns]
-    time_col = next((c for c in ("TIME_PERIOD", "TIME_PERIOD_ID", "TIME") if c in df), None)
-    value_col = next((c for c in ("OBS_VALUE", "OBS_VALUE_NUMERIC", "VALUE") if c in df), None)
+
+    time_col = next(
+        (c for c in ("TIME_PERIOD", "TIME_PERIOD_ID", "TIME") if c in df),
+        None
+    )
+    value_col = next(
+        (c for c in ("OBS_VALUE", "OBS_VALUE_NUMERIC", "VALUE") if c in df),
+        None
+    )
+
     if time_col is None or value_col is None:
-        raise ValueError(f"Unexpected IMF response columns: {', '.join(df.columns[:18])}")
-    result = pd.DataFrame({"month": pd.to_datetime(df[time_col], errors="coerce"),
-                           "value": pd.to_numeric(df[value_col], errors="coerce")})
-    result = result.dropna().drop_duplicates("month", keep="last").set_index("month").sort_index()
-    return result
+        raise ValueError("Unexpected IMF data columns")
+
+    labels = df[time_col].str.strip()
+    labels = labels.str.replace(
+        r"^(\d{4})-M(0[1-9]|1[0-2])$", r"\1-\2", regex=True
+    )
+    labels = labels.str.replace(
+        r"^(\d{4})(\d{2})$", r"\1-\2", regex=True
+    )
+
+    valid = labels.str.fullmatch(r"\d{4}-(0[1-9]|1[0-2])(?:-01)?")
+    if not valid.fillna(False).all():
+        raise ValueError("IMF returned unrecognized monthly dates")
+
+    months = pd.to_datetime(
+        labels.str.slice(0, 7) + "-01",
+        format="%Y-%m-%d"
+    )
+
+    result = pd.DataFrame({
+        "month": months,
+        "value": pd.to_numeric(df[value_col], errors="coerce")
+    }).dropna()
+
+    result = result[result["month"] >= pd.Timestamp("1976-01-01")]
+
+    if result["month"].duplicated().any():
+        raise ValueError("Duplicate IMF monthly observations")
+
+    return result.set_index("month").sort_index()
+
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
