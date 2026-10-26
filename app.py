@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
+import re
 import io
 import requests
 import pandas as pd
@@ -29,17 +30,36 @@ st.title("Real Exchange Rate Explorer")
 st.caption("Monthly IMF CPI and exchange-rate data · Available observations from January 1976 onward")
 
 
+def _parse_months(raw: pd.Series) -> pd.Series:
+    """Parse explicit IMF monthly period labels; never interpret numbers as Unix timestamps."""
+    labels = raw.astype("string").str.strip()
+    # IMF monthly periods should be YYYY-MM, YYYY-MM-DD, or YYYYMM.
+    labels = labels.str.replace(r"^(\d{4})(\d{2})$", r"\1-\2", regex=True)
+    valid = labels.str.fullmatch(r"\d{4}-(0[1-9]|1[0-2])(?:-01)?")
+    if not valid.fillna(False).all():
+        examples = labels[~valid.fillna(False)].dropna().head(4).tolist()
+        raise ValueError(
+            "IMF returned period labels that are not recognizable calendar months: "
+            f"{examples}. Stopping instead of assigning incorrect dates."
+        )
+    months = pd.to_datetime(labels.str.slice(0, 7) + "-01", format="%Y-%m-%d", errors="raise")
+    return months
+
+
 def _read_sdmx_csv(content: bytes) -> pd.DataFrame:
-    """Read IMF SDMX CSV 1.0 or 2.0; normalize time/value columns."""
-    df = pd.read_csv(io.BytesIO(content), low_memory=False)
+    """Read IMF SDMX CSV and strictly normalize monthly time/value columns."""
+    df = pd.read_csv(io.BytesIO(content), low_memory=False, dtype={"TIME_PERIOD": "string", "TIME_PERIOD_ID": "string", "TIME": "string"})
     df.columns = [str(c).strip() for c in df.columns]
     time_col = next((c for c in ("TIME_PERIOD", "TIME_PERIOD_ID", "TIME") if c in df), None)
     value_col = next((c for c in ("OBS_VALUE", "OBS_VALUE_NUMERIC", "VALUE") if c in df), None)
     if time_col is None or value_col is None:
         raise ValueError(f"Unexpected IMF response columns: {', '.join(df.columns[:18])}")
-    result = pd.DataFrame({"month": pd.to_datetime(df[time_col], errors="coerce"),
+    result = pd.DataFrame({"month": _parse_months(df[time_col]),
                            "value": pd.to_numeric(df[value_col], errors="coerce")})
-    result = result.dropna().drop_duplicates("month", keep="last").set_index("month").sort_index()
+    result = result.dropna(subset=["value"])
+    if result["month"].duplicated().any():
+        raise ValueError("IMF returned multiple observations for the same month; check the series key.")
+    result = result.set_index("month").sort_index()
     return result
 
 
@@ -94,11 +114,16 @@ with st.spinner("Retrieving IMF observations…"):
 # IMF rates are local-currency units per USD. Divide country-2 rate by country-1 rate.
 df = pd.concat([p1.rename("CPI_1"), p2.rename("CPI_2"),
                 e1.rename("Local_1_per_USD"), e2.rename("Local_2_per_USD")], axis=1)
-df = df[(df > 0).all(axis=1)].dropna().sort_index()
+df = df.dropna().sort_index()
+df = df[(df > 0).all(axis=1)]
+df = df.loc[df.index >= pd.Timestamp("1976-01-01")]
+if not df.empty and (df.index.day != 1).any():
+    st.error("Monthly dates could not be verified. No calculations were produced.")
+    st.stop()
 df["S_country2_per_country1"] = df["Local_2_per_USD"] / df["Local_1_per_USD"]
 df["RER"] = df["S_country2_per_country1"] * df["CPI_1"] / df["CPI_2"]
 if df.empty:
-    st.error("No overlapping positive CPI and FX observations for these countries.")
+    st.error("No overlapping positive CPI and FX observations from January 1976 onward for these countries.")
     st.stop()
 
 first_date, last_date = df.index.min().date(), df.index.max().date()
@@ -136,6 +161,7 @@ fig.update_layout(title=f"{first} vs {second}: {mode} exchange rate", xaxis_titl
 st.plotly_chart(fig, use_container_width=True)
 
 export = selection.reset_index().rename(columns={"month": "Month", "index": "Month"})
+export["Month"] = pd.to_datetime(export["Month"]).dt.strftime("%Y-%m")
 export["Country_1"] = first
 export["Country_2"] = second
 export["Sample_mean_RER"] = mean_rer
